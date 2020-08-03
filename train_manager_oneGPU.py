@@ -13,9 +13,8 @@ from sklearn.metrics import precision_score, recall_score
 from tqdm import tqdm
 import os
 import torch.nn.functional as F
-import horovod.torch as hvd
 
-os.environ['CUDA_VISIBLE_DEVICES'] = '0,1'
+os.environ['CUDA_VISIBLE_DEVICES'] = '1'
 parser = argparse.ArgumentParser("VOC_2012")
 parser.add_argument('--workers', type=int, default=4, help='number of workers to load dataset')
 # parser.add_argument('--data', type=str, default='/tmp/cache/', help='location of the data corpus')
@@ -50,15 +49,9 @@ logging.getLogger().addHandler(fh)
 
 
 def main():
-    # Initialize Horovod
-    hvd.init()
-
-    # Pin GPU to be used to process local rank (one GPU per process)
-    torch.cuda.set_device(hvd.local_rank())
-
     # Scale the learning rate by the number of workers.
-    init_lr = args.base_lr * hvd.size()
-    init_arch_lr = args.base_arch_lr * hvd.size()
+    init_lr = args.base_lr
+    init_arch_lr = args.base_arch_lr
 
     # Partition dataset among workers using DistributedSampler
     train_dataset = mydataset(dataroot='/NAS_REMOTE/shaozl/dataset/Pascal_VOC/VOC_2012/VOCdevkit/VOC2012/JPEGImages/',
@@ -66,14 +59,9 @@ def main():
     val_dataset = mydataset(dataroot='/NAS_REMOTE/shaozl/dataset/Pascal_VOC/VOC_2012/VOCdevkit/VOC2012/JPEGImages/',
                             lableroot='/NAS_REMOTE/shaozl/MS-CAM-NAS/', phase='val')
 
-    train_sampler = torch.utils.data.distributed.DistributedSampler(
-        train_dataset, num_replicas=hvd.size(), rank=hvd.rank())
-    val_sampler = torch.utils.data.distributed.DistributedSampler(
-        val_dataset, num_replicas=hvd.size(), rank=hvd.rank())
-
     model = trapezoid_supernet(max_scale=4, num_layers=12).cuda()
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, sampler=train_sampler)
-    val_loader = DataLoader(val_dataset, batch_size=args.batch_size, sampler=val_sampler)
+    train_loader = DataLoader(train_dataset, batch_size=args.batch_size)
+    val_loader = DataLoader(val_dataset, batch_size=args.batch_size)
 
     criterion = nn.MultiLabelSoftMarginLoss().cuda()
     optimizer = torch.optim.SGD(model.weight_parameters(),
@@ -82,19 +70,11 @@ def main():
                                 weight_decay=args.weight_decay)
     optimizer_a = torch.optim.Adam(model.arch_parameters(), lr=init_arch_lr, betas=(0.9, 0.999),
                                    weight_decay=args.arch_weight_decay)
-    # Add Horovod Distributed Optimizer
-    optimizer = hvd.DistributedOptimizer(optimizer, named_parameters=model.named_parameters_weight())
-    optimizer_a = hvd.DistributedOptimizer(optimizer_a, named_parameters=model.named_parameters_arch())
 
-    # Broadcast parameters from rank 0 to all other processes.
-    hvd.broadcast_parameters(model.state_dict(), root_rank=0)
 
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, float(args.epochs), eta_min=args.learning_rate_min)
 
-    is_root=False
-    if hvd.rank()==0:
-        is_root=True
 
     for epoch in range(args.epochs):
         current_lr = scheduler.get_lr()[0]
@@ -105,17 +85,17 @@ def main():
 
         precision, recall, train_obj = train(train_loader, val_loader, model, optimizer, optimizer_a, criterion,
                                              current_lr,
-                                             epoch,is_root)
+                                             epoch)
         scheduler.step()
 
 
-def train(train_loader, val_loader, model, optimizer, optimizer_a, criterion, lr, epoch,is_root):
+def train(train_loader, val_loader, model, optimizer, optimizer_a, criterion, lr, epoch):
     objs = AvgrageMeter()
     recalls = AvgrageMeter()
     precisions = AvgrageMeter()
 
     with tqdm(total=len(train_loader),
-              desc='Train Epoch #{}'.format(epoch),disable=not is_root)as t:
+              desc='Train Epoch #{}'.format(epoch))as t:
         # disable=not run_manager.is_root, dynamic_ncols=True) as t:
         for step, (input, target) in enumerate(train_loader):
             model.train()
@@ -133,32 +113,18 @@ def train(train_loader, val_loader, model, optimizer, optimizer_a, criterion, lr
             input_search = input_search.cuda(non_blocking=True)
             target_search = target_search.cuda(non_blocking=True)
 
-            # if epoch >= args.begin:
-            #     optimizer_a.zero_grad()
-            #     logits = model(input_search)
-            #     loss_a = criterion(logits, target_search)
-            #     loss_a.backward()
-            #     optimizer_a.synchronize()
-            #     # optimizer_a.step()
-            #     with optimizer_a.skip_synchronize():
-            #         optimizer_a.step()
+            if epoch >= args.begin:
+                optimizer_a.zero_grad()
+                logits = model(input_search)
+                loss_a = criterion(logits, target_search)
+                loss_a.backward()
+                optimizer_a.step()
 
             optimizer.zero_grad()
-            optimizer_a._handles.clear()
-            # optimizer_a.zero_grad()
             logits = model(input)
             loss = criterion(logits, target)
-
             loss.backward()
-            if hvd.rank()==0:
-                print('back_ok')
             optimizer.step()
-            if hvd.rank()==0:
-                print('step_ok')
-            # optimizer.synchronize()
-
-            # with optimizer.skip_synchronize():
-            #     optimizer.step()
 
             precision = precision_score(F.sigmoid(logits).cpu().data.numpy().round(),
                                         target.cpu().data.numpy().round(), average='micro')

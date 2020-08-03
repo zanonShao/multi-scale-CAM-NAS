@@ -5,6 +5,9 @@ from operations import *
 from torch.autograd import Variable
 from genotypes import PRIMITIVES
 from genotypes import Genotype
+import pytorch_lightning as pl
+from MyDataloader import mydataset
+from torch.utils.data import DataLoader
 
 
 def channel_shuffle(x, groups):
@@ -182,7 +185,7 @@ class Block(nn.Module):
         return out
 
 
-class trapezoid_supernet(nn.Module):
+class trapezoid_supernet(pl.LightningModule):
     def __init__(self, steps=3, num_layers=15, max_scale=6, fl_channel=48):
         super(trapezoid_supernet, self).__init__()
         # give to self.
@@ -227,6 +230,10 @@ class trapezoid_supernet(nn.Module):
                     Blocks.append(Block(x, y, self.max_scale, C_curr))
             self.Layers.append(Blocks)
 
+        self.Classfiers = nn.ModuleList()
+        for i in range(self.max_scale):
+            self.Classfiers.append(nn.Conv2d(fl_channel * pow(2, i), 20, 1))
+
         self._initialize_alphas()
 
     def forward(self, x):
@@ -236,10 +243,16 @@ class trapezoid_supernet(nn.Module):
         for i, blocks in enumerate(self.Layers):
             j = len(blocks)
             for k in range(4):
-                # print(self.betas[0][0:1][0].shape)
-                # print(i,j,k)
-                # print(self.betas[i][:j + 1][k].shape)
-                normalized_betas[i][k][:j] = F.softmax(self.betas[i][k][:j], dim=-1)
+                start = 0
+                end = j
+                if k == 0:  # down has no j=0 blocks
+                    start = start + 1
+                if k == 2:  # up has no j = max Blocks
+                    end = j - 1
+                try:
+                    normalized_betas[i][k][:j] = F.softmax(self.betas[i][k][start:end], dim=-1)
+                except:
+                    pass
         normalized_betas = normalized_betas.cuda()
 
         normalized_alph = []
@@ -288,7 +301,10 @@ class trapezoid_supernet(nn.Module):
             xs_pre = xs_curr
 
         # classify layers
-        return xs_curr
+        xs_curr = [F.adaptive_avg_pool2d(self.Classfiers[i](x), 1) for i, x in enumerate(xs_curr)]
+        xs_curr = torch.stack(xs_curr)
+        xs_curr = torch.mean(xs_curr, dim=0)
+        return xs_curr.squeeze()
 
     def _initialize_alphas(self):
         k_edge = sum(1 for i in range(self._steps) for n in range(1 + i))
@@ -303,25 +319,103 @@ class trapezoid_supernet(nn.Module):
 
         num_ops = len(PRIMITIVES)
 
-        self.alphas_down=Variable(1e-3 * torch.randn(k_edge, num_ops).cuda(), requires_grad=True)
-        self.alphas_same = Variable(1e-3 * torch.randn(k_edge, num_ops).cuda(), requires_grad=True)
-        self.alphas_up = Variable(1e-3 * torch.randn(k_edge, num_ops).cuda(), requires_grad=True)
-        self.p_down = Variable(1e-3 * torch.randn(k_edge).cuda(), requires_grad=True)
-        self.p_same = Variable(1e-3 * torch.randn(k_edge).cuda(), requires_grad=True)
-        self.p_up = Variable(1e-3 * torch.randn(k_edge).cuda(), requires_grad=True)
-        self.betas = Variable(1e-3 * torch.randn(self.num_layers, 4, self.max_scale).cuda(), requires_grad=True)
+        alphas_down = Variable(1e-3 * torch.randn(k_edge, num_ops).cuda(), requires_grad=True)
+        alphas_same = Variable(1e-3 * torch.randn(k_edge, num_ops).cuda(), requires_grad=True)
+        alphas_up = Variable(1e-3 * torch.randn(k_edge, num_ops).cuda(), requires_grad=True)
+        p_down = Variable(1e-3 * torch.randn(k_edge).cuda(), requires_grad=True)
+        p_same = Variable(1e-3 * torch.randn(k_edge).cuda(), requires_grad=True)
+        p_up = Variable(1e-3 * torch.randn(k_edge).cuda(), requires_grad=True)
+        betas = Variable(1e-3 * torch.randn(self.num_layers, 4, self.max_scale).cuda(), requires_grad=True)
         self._arch_parameters = [
-            self.alphas_down,
-            self.alphas_same,
-            self.alphas_up,
-            self.p_down,
-            self.p_same,
-            self.p_up,
-            self.betas,
+            alphas_down,
+            alphas_same,
+            alphas_up,
+            p_down,
+            p_same,
+            p_up,
+            betas,
+        ]
+        self._arch_param_names = [
+            'alphas_down',
+            'alphas_same',
+            'alphas_up',
+            'p_down',
+            'p_same',
+            'p_up',
+            'betas',
         ]
 
+        [self.register_parameter(name, torch.nn.Parameter(param)) for name, param in
+         zip(self._arch_param_names, self._arch_parameters)]
+
     def arch_parameters(self):
-        return self._arch_parameters
+        return [param for name, param in self.named_parameters() if name in self._arch_param_names]
+
+    def weight_parameters(self):
+        return [param for name, param in self.named_parameters() if name not in self._arch_param_names]
+
+    def named_parameters_arch(self, prefix='', recurse=True):
+        gen = self._named_members(
+            lambda module: module._parameters.items(),
+            prefix=prefix, recurse=recurse)
+        for elem in gen:
+            if elem[0] in self._arch_param_names:
+                yield elem
+            else:
+                continue
+
+    def named_parameters_weight(self, prefix='', recurse=True):
+        gen = self._named_members(
+            lambda module: module._parameters.items(),
+            prefix=prefix, recurse=recurse)
+        for elem in gen:
+            if elem[0] not in self._arch_param_names:
+                yield elem
+            else:
+                continue
+
+
+    def training_step(self, batch, batch_nb):
+        x, y = batch
+        # print(x.shape)
+        logits = self(x)
+        loss = F.multilabel_soft_margin_loss(logits, y)
+        return {'loss': loss}
+
+    # def validation_step(self,batch,batch_nb):
+    #     x, y = batch
+    #     logits = self(x)
+    #     loss = F.MultiLabelSoftMarginLoss(logits, y)
+    #     self.outputs.append({'val_loss': loss})
+    #     return loss
+
+    def train_dataloader(self):
+        return DataLoader(
+            mydataset(dataroot='/NAS_REMOTE/shaozl/dataset/Pascal_VOC/VOC_2012/VOCdevkit/VOC2012/JPEGImages/',
+                      lableroot='/NAS_REMOTE/shaozl/MS-CAM-NAS/', phase='train'), batch_size=14)
+        # DataLoader(mydataset(dataroot='/NAS_REMOTE/shaozl/dataset/Pascal_VOC/VOC_2012/VOCdevkit/VOC2012/JPEGImages/',
+        #                      lableroot='/NAS_REMOTE/shaozl/MS-CAM-NAS/', phase='val'), batch_size=14)
+
+    # def val_dataloader(self):
+    #     return mydataset(dataroot='/NAS_REMOTE/shaozl/dataset/Pascal_VOC/VOC_2012/VOCdevkit/VOC2012/JPEGImages/',lableroot='/NAS_REMOTE/shaozl/MS-CAM-NAS/',phase='val')
+
+    def configure_optimizers(self):
+        optimizer_1 = torch.optim.SGD(self.parameters(), lr=0.05)
+        optimizer_2 = torch.optim.Adam(self.arch_parameters, lr=0.001)
+        return [optimizer_1, optimizer_2]
+
+    def optimizer_step(self, current_epoch, batch_nb, optimizer, optimizer_i, second_order_closure, on_tpu,
+                       using_native_amp, using_lbfgs):
+        if optimizer_i == 0:
+            optimizer.step()
+            optimizer.zero_grad()
+
+        if optimizer_i == 1:
+            if current_epoch >= 0:
+                optimizer.step()
+                optimizer.zero_grad()
+
+
 
 # CUDA_VISIBLE_DEVICES=0
 if __name__ == '__main__':
@@ -330,14 +424,23 @@ if __name__ == '__main__':
     os.environ['CUDA_VISIBLE_DEVICES'] = '0'
     max_scale = 4
     net = trapezoid_supernet(max_scale=max_scale, num_layers=12).cuda()
-    for i in net.parameters():
-        print(type(i))
-
-    print(type(net.arch_parameters()))
-    # x = torch.randn(14, 3, 224, 224).cuda()
-    # out = net(x)
+    # for i in net.parameters():
+    #     print(type(i))
+    #
+    # print(type(net.arch_parameters()))
+    dataLoader = DataLoader(
+        mydataset(dataroot='/NAS_REMOTE/shaozl/dataset/Pascal_VOC/VOC_2012/VOCdevkit/VOC2012/JPEGImages/',
+                  lableroot='/NAS_REMOTE/shaozl/MS-CAM-NAS/', phase='train'), batch_size=14)
+    for x, y in dataLoader:
+        # x = torch.randn(14, 3, 224, 224).cuda()
+        x = x.cuda()
+        print(x.shape)
+        out = net(x)
+        print(out)
+        exit(0)
     # print('ok')
     # for i in range(max_scale):
     #     print(out[i].shape)
-    # import time
-    # time.sleep(3600)
+    import time
+
+    time.sleep(3600)

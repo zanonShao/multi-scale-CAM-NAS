@@ -3,6 +3,7 @@ import os
 import numpy as np
 from PIL import Image
 import torchvision.transforms as transforms
+import torch
 
 class mydataset(Dataset):
     def __init__(self,dataroot='',lableroot='',phase='train',shape=224,data_type='dict'):
@@ -16,25 +17,25 @@ class mydataset(Dataset):
 
         if phase!='test':
             self.transform = transforms.Compose([
-                transforms.RandomResizedCrop(224),
+                transforms.RandomResizedCrop(shape),
                 transforms.RandomHorizontalFlip(),
                 transforms.ToTensor(),
-                transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                                     std=[0.229, 0.224, 0.225]),
+                transforms.Normalize(mean=[0.4604598566668132, 0.43647458501470804, 0.4032827079361192],
+                                     std=[0.4604598566668132, 0.43647458501470804, 0.4032827079361192]),
             ])
         else:
             self.transform = transforms.Compose([
                 transforms.Resize(256),
-                transforms.CenterCrop(224),
+                transforms.CenterCrop(shape),
                 transforms.ToTensor(),
-                transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                                     std=[0.229, 0.224, 0.225]),
+                transforms.Normalize(mean=[0.4604598566668132, 0.43647458501470804, 0.4032827079361192],
+                                     std=[0.4604598566668132, 0.43647458501470804, 0.4032827079361192]),
             ])
 
     def __getitem__(self, item):
         image = Image.open(os.path.join(self.dataroot,self.image_path[item]+'.jpg')).convert('RGB')
         image = self.transform(image)
-        label = self.lable[item]
+        label = torch.tensor(self.lable[item])
         return image,label
 
     def __len__(self):
