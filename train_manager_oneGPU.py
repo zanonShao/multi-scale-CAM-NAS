@@ -9,16 +9,17 @@ import argparse
 from torch.utils.data import DataLoader
 from utils import *
 import sys
-from sklearn.metrics import precision_score, recall_score
+from sklearn.metrics import precision_score, recall_score,average_precision_score
 from tqdm import tqdm
 import os
 import torch.nn.functional as F
+import utils
 
-os.environ['CUDA_VISIBLE_DEVICES'] = '1'
+
 parser = argparse.ArgumentParser("VOC_2012")
 parser.add_argument('--workers', type=int, default=4, help='number of workers to load dataset')
 # parser.add_argument('--data', type=str, default='/tmp/cache/', help='location of the data corpus')
-parser.add_argument('--batch_size', type=int, default=14, help='batch size')
+parser.add_argument('--batch_size', type=int, default=36, help='batch size')
 parser.add_argument('--base_lr', type=float, default=0.025, help='init learning rate')
 parser.add_argument('--learning_rate_min', type=float, default=0.001, help='min learning rate')
 parser.add_argument('--momentum', type=float, default=0.9, help='momentum')
@@ -27,7 +28,7 @@ parser.add_argument('--report_freq', type=float, default=50, help='report freque
 parser.add_argument('--epochs', type=int, default=60, help='num of training epochs')
 # parser.add_argument('--init_channels', type=int, default=16, help='num of init channels')
 # parser.add_argument('--layers', type=int, default=8, help='total number of layers')
-parser.add_argument('--model_path', type=str, default='saved_models', help='path to save the model')
+parser.add_argument('--model_path', type=str, default='./saved_models', help='path to save the model')
 # parser.add_argument('--cutout', action='store_true', default=False, help='use cutout')
 # parser.add_argument('--cutout_length', type=int, default=16, help='cutout length')
 # parser.add_argument('--drop_path_prob', type=float, default=0.3, help='drop path probability')
@@ -37,9 +38,12 @@ parser.add_argument('--save', type=str, default='./', help='experiment name')
 # parser.add_argument('--unrolled', action='store_true', default=False, help='use one-step unrolled validation loss')
 parser.add_argument('--base_arch_lr', type=float, default=3e-3, help='learning rate for arch encoding')
 parser.add_argument('--arch_weight_decay', type=float, default=1e-3, help='weight decay for arch encoding')
-parser.add_argument('--begin', type=int, default=35, help='batch size')
+parser.add_argument('--begin', type=int, default=6, help='batch size')
+parser.add_argument('--val_frequency', type=int, default=5, help='val frequency')
+parser.add_argument('--gpus',type=str,default='0')
 args = parser.parse_args()
 
+os.environ['CUDA_VISIBLE_DEVICES'] = args.gpus
 log_format = '%(asctime)s %(message)s'
 logging.basicConfig(stream=sys.stdout, level=logging.INFO,
                     format=log_format, datefmt='%m/%d %I:%M:%S %p')
@@ -54,14 +58,15 @@ def main():
     init_arch_lr = args.base_arch_lr
 
     # Partition dataset among workers using DistributedSampler
-    train_dataset = mydataset(dataroot='/NAS_REMOTE/shaozl/dataset/Pascal_VOC/VOC_2012/VOCdevkit/VOC2012/JPEGImages/',
+    train_dataset = mydataset(dataroot='/data/shaozilong666/datasets/Pascal_VOC/VOC_2012/VOCdevkit/VOC2012/JPEGImages/',
                               lableroot='/NAS_REMOTE/shaozl/MS-CAM-NAS/', phase='train')
-    val_dataset = mydataset(dataroot='/NAS_REMOTE/shaozl/dataset/Pascal_VOC/VOC_2012/VOCdevkit/VOC2012/JPEGImages/',
+    val_dataset = mydataset(dataroot='/data/shaozilong666/datasets/Pascal_VOC/VOC_2012/VOCdevkit/VOC2012/JPEGImages/',
                             lableroot='/NAS_REMOTE/shaozl/MS-CAM-NAS/', phase='val')
 
     model = trapezoid_supernet(max_scale=4, num_layers=12).cuda()
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size)
     val_loader = DataLoader(val_dataset, batch_size=args.batch_size)
+    val_loader_2 = DataLoader(val_dataset, batch_size=args.batch_size*100)
 
     criterion = nn.MultiLabelSoftMarginLoss().cuda()
     optimizer = torch.optim.SGD(model.weight_parameters(),
@@ -76,29 +81,48 @@ def main():
         optimizer, float(args.epochs), eta_min=args.learning_rate_min)
 
 
+    best_mAP = 0
     for epoch in range(args.epochs):
         current_lr = scheduler.get_lr()[0]
         logging.info('Epoch: %d lr: %e', epoch, current_lr)
         # genotype = model.genotype(
         logging.info('genotype = %s', 'wait to complete')
-        arch_param = model.arch_parameters()
+        # arch_param = model.arch_parameters()
 
-        precision, recall, train_obj = train(train_loader, val_loader, model, optimizer, optimizer_a, criterion,
-                                             current_lr,
-                                             epoch)
+        mAP, obj = train(train_loader, val_loader, model, optimizer, optimizer_a, criterion,
+                                             current_lr,epoch)
         scheduler.step()
+
+        is_best = False
+        if epoch % args.val_frequency == 0:
+            mAP, obj = infer(val_loader_2, model, criterion, epoch)
+
+            if mAP > best_mAP:
+                best_mAP = mAP
+                is_best = True
+
+        utils.save_checkpoint({
+            'epoch': epoch,
+            'state_dict': model.state_dict(),
+            'best_acc_top1': best_mAP,
+            'optimizer': optimizer.state_dict(),
+            'optimizer_a': optimizer_a.state_dict(),
+        },is_best,args.model_path)
+
+
 
 
 def train(train_loader, val_loader, model, optimizer, optimizer_a, criterion, lr, epoch):
     objs = AvgrageMeter()
-    recalls = AvgrageMeter()
-    precisions = AvgrageMeter()
+    mAPs = AvgrageMeter()
+    # recalls = AvgrageMeter()
+    # precisions = AvgrageMeter()
+    model.train()
 
     with tqdm(total=len(train_loader),
               desc='Train Epoch #{}'.format(epoch))as t:
         # disable=not run_manager.is_root, dynamic_ncols=True) as t:
         for step, (input, target) in enumerate(train_loader):
-            model.train()
             n = input.size(0)
 
             input = input.cuda()
@@ -120,31 +144,61 @@ def train(train_loader, val_loader, model, optimizer, optimizer_a, criterion, lr
                 loss_a.backward()
                 optimizer_a.step()
 
+
             optimizer.zero_grad()
             logits = model(input)
             loss = criterion(logits, target)
             loss.backward()
             optimizer.step()
 
-            precision = precision_score(F.sigmoid(logits).cpu().data.numpy().round(),
-                                        target.cpu().data.numpy().round(), average='micro')
-            recall = recall_score(F.sigmoid(logits).cpu().data.numpy().round(),
-                                  target.cpu().data.numpy().round(), average='micro')
+
+            # precision = precision_score(F.sigmoid(logits).cpu().data.numpy().round(),
+            #                             target.cpu().data.numpy().round(), average='micro')
+            # recall = recall_score(F.sigmoid(logits).cpu().data.numpy().round(),
+            #                       target.cpu().data.numpy().round(), average='micro')
+            mAP = utils.compute_mAP(target,F.sigmoid(logits))
             objs.update(loss.cpu().data.numpy(), n)
-            precisions.update(precision, n)
-            recalls.update(recall, n)
+            mAPs.update(mAP,n)
+            # precisions.update(precision, n)
+            # recalls.update(recall, n)
 
             # if step % args.report_freq == 0:
             #     logging.info('TRAIN Step: %03d Objs: %e precision: %f recall: %f', step, objs.avg, precisions.avg,
             #                  recalls.avg)
             t.set_postfix({
                 'loss': objs.avg,
-                'precision': precisions.avg,
-                'recall': recalls.avg,
+                'mAP': mAPs.avg,
                 'lr': lr,
             })
             t.update(1)
-    return precisions.avg, recalls.avg, objs.avg
+    return mAPs.avg, objs.avg
+
+def infer(val_loader, model, criterion,epoch):
+    objs = AvgrageMeter()
+    mAPs = AvgrageMeter()
+    model.eval()
+    with tqdm(total=len(val_loader),
+              desc='Val Epoch #{}'.format(epoch))as t:
+        for step, (input, target) in enumerate(val_loader):
+            input = input.cuda()
+            target = target.cuda()
+
+            with torch.no_grad():
+                logits = model(input)
+            loss = criterion(logits, target)
+
+            n = input.size(0)
+            mAP = utils.compute_mAP(target, F.sigmoid(logits))
+            objs.update(loss.cpu().data.numpy(), n)
+            mAPs.update(mAP, n)
+
+            t.set_postfix({
+                'loss': objs.avg,
+                'mAP': mAPs.avg,
+            })
+            t.update(1)
+
+    return mAPs.avg, objs.avg
 
 
 if __name__ == '__main__':

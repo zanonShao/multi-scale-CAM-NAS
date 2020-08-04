@@ -4,6 +4,8 @@ import torch
 import shutil
 import torchvision.transforms as transforms
 from torch.autograd import Variable
+from sklearn.metrics import precision_score, recall_score,average_precision_score
+
 
 
 class AvgrageMeter(object):
@@ -119,3 +121,10 @@ def create_exp_dir(path, scripts_to_save=None):
       dst_file = os.path.join(path, 'scripts', os.path.basename(script))
       shutil.copyfile(script, dst_file)
 
+def compute_mAP(labels,outputs):
+    y_true = labels.cpu().detach().numpy()
+    y_pred = outputs.cpu().detach().numpy()
+    AP = []
+    for i in range(y_true.shape[0]):
+        AP.append(average_precision_score(y_true[i],y_pred[i]))
+    return np.mean(AP)

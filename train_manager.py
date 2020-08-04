@@ -9,11 +9,12 @@ import argparse
 from torch.utils.data import DataLoader
 from utils import *
 import sys
-from sklearn.metrics import precision_score, recall_score
+from sklearn.metrics import precision_score, recall_score,average_precision_score
 from tqdm import tqdm
 import os
 import torch.nn.functional as F
 import horovod.torch as hvd
+import utils
 
 os.environ['CUDA_VISIBLE_DEVICES'] = '0,1'
 parser = argparse.ArgumentParser("VOC_2012")
@@ -28,7 +29,7 @@ parser.add_argument('--report_freq', type=float, default=50, help='report freque
 parser.add_argument('--epochs', type=int, default=60, help='num of training epochs')
 # parser.add_argument('--init_channels', type=int, default=16, help='num of init channels')
 # parser.add_argument('--layers', type=int, default=8, help='total number of layers')
-parser.add_argument('--model_path', type=str, default='saved_models', help='path to save the model')
+parser.add_argument('--model_path', type=str, default='./saved_models', help='path to save the model')
 # parser.add_argument('--cutout', action='store_true', default=False, help='use cutout')
 # parser.add_argument('--cutout_length', type=int, default=16, help='cutout length')
 # parser.add_argument('--drop_path_prob', type=float, default=0.3, help='drop path probability')
@@ -39,6 +40,7 @@ parser.add_argument('--save', type=str, default='./', help='experiment name')
 parser.add_argument('--base_arch_lr', type=float, default=3e-3, help='learning rate for arch encoding')
 parser.add_argument('--arch_weight_decay', type=float, default=1e-3, help='weight decay for arch encoding')
 parser.add_argument('--begin', type=int, default=35, help='batch size')
+parser.add_argument('--val_frequency', type=int, default=1, help='val frequency')
 args = parser.parse_args()
 
 log_format = '%(asctime)s %(message)s'
@@ -96,6 +98,7 @@ def main():
     if hvd.rank()==0:
         is_root=True
 
+    best_mAP = 0
     for epoch in range(args.epochs):
         current_lr = scheduler.get_lr()[0]
         logging.info('Epoch: %d lr: %e', epoch, current_lr)
@@ -103,22 +106,42 @@ def main():
         logging.info('genotype = %s', 'wait to complete')
         arch_param = model.arch_parameters()
 
-        precision, recall, train_obj = train(train_loader, val_loader, model, optimizer, optimizer_a, criterion,
+        mAP, obj = train(train_loader, val_loader, model, optimizer, optimizer_a, criterion,
                                              current_lr,
                                              epoch,is_root)
         scheduler.step()
 
+        is_best=False
+        if epoch % args.val_frequency:
+            mAP, obj = infer(val_loader,model,criterion,epoch)
+
+            if mAP > best_mAP:
+                best_mAP = mAP
+                is_best = True
+
+        utils.save_checkpoint({
+            'epoch': epoch,
+            'state_dict': model.state_dict(),
+            'best_acc_top1': best_mAP,
+            'optimizer': optimizer.state_dict(),
+            'optimizer_a': optimizer_a.state_dict(),
+        },is_best,args.model_path)
+
+
+
+
 
 def train(train_loader, val_loader, model, optimizer, optimizer_a, criterion, lr, epoch,is_root):
     objs = AvgrageMeter()
-    recalls = AvgrageMeter()
-    precisions = AvgrageMeter()
+    mAPs = AvgrageMeter()
+    # recalls = AvgrageMeter()
+    # precisions = AvgrageMeter()
+    model.train()
 
     with tqdm(total=len(train_loader),
               desc='Train Epoch #{}'.format(epoch),disable=not is_root)as t:
         # disable=not run_manager.is_root, dynamic_ncols=True) as t:
         for step, (input, target) in enumerate(train_loader):
-            model.train()
             n = input.size(0)
 
             input = input.cuda()
@@ -133,15 +156,13 @@ def train(train_loader, val_loader, model, optimizer, optimizer_a, criterion, lr
             input_search = input_search.cuda(non_blocking=True)
             target_search = target_search.cuda(non_blocking=True)
 
-            # if epoch >= args.begin:
-            #     optimizer_a.zero_grad()
-            #     logits = model(input_search)
-            #     loss_a = criterion(logits, target_search)
-            #     loss_a.backward()
-            #     optimizer_a.synchronize()
-            #     # optimizer_a.step()
-            #     with optimizer_a.skip_synchronize():
-            #         optimizer_a.step()
+            if epoch >= args.begin:
+                optimizer_a.zero_grad()
+                logits = model(input_search)
+                loss_a = criterion(logits, target_search)
+                loss_a.backward()
+                optimizer_a.step()
+                optimizer.synchronize()
 
             optimizer.zero_grad()
             optimizer_a._handles.clear()
@@ -155,30 +176,59 @@ def train(train_loader, val_loader, model, optimizer, optimizer_a, criterion, lr
             optimizer.step()
             if hvd.rank()==0:
                 print('step_ok')
+            optimizer_a.synchronize()
             # optimizer.synchronize()
 
             # with optimizer.skip_synchronize():
             #     optimizer.step()
 
-            precision = precision_score(F.sigmoid(logits).cpu().data.numpy().round(),
-                                        target.cpu().data.numpy().round(), average='micro')
-            recall = recall_score(F.sigmoid(logits).cpu().data.numpy().round(),
-                                  target.cpu().data.numpy().round(), average='micro')
+
+            # precision = precision_score(F.sigmoid(logits).cpu().data.numpy().round(),
+            #                             target.cpu().data.numpy().round(), average='micro')
+            # recall = recall_score(F.sigmoid(logits).cpu().data.numpy().round(),
+            #                       target.cpu().data.numpy().round(), average='micro')
+            mAP = utils.compute_mAP(target,F.sigmoid(logits))
             objs.update(loss.cpu().data.numpy(), n)
-            precisions.update(precision, n)
-            recalls.update(recall, n)
+            mAPs.update(mAP,n)
+            # precisions.update(precision, n)
+            # recalls.update(recall, n)
 
             # if step % args.report_freq == 0:
             #     logging.info('TRAIN Step: %03d Objs: %e precision: %f recall: %f', step, objs.avg, precisions.avg,
             #                  recalls.avg)
             t.set_postfix({
                 'loss': objs.avg,
-                'precision': precisions.avg,
-                'recall': recalls.avg,
+                'mAP': mAPs.avg,
                 'lr': lr,
             })
             t.update(1)
-    return precisions.avg, recalls.avg, objs.avg
+    return mAPs.avg, objs.avg
+
+def infer(val_loader, model, criterion,epoch):
+    objs = AvgrageMeter()
+    mAPs = AvgrageMeter()
+    model.eval()
+    with tqdm(total=len(val_loader),
+              desc='Val Epoch #{}'.format(epoch))as t:
+        for step, (input, target) in enumerate(val_loader):
+            input = input.cuda()
+            target = target.cuda()
+
+            logits = model(input)
+            loss = criterion(logits, target)
+
+            n = input.size(0)
+            mAP = utils.compute_mAP(target, F.sigmoid(logits))
+            objs.update(loss.cpu().data.numpy(), n)
+            mAPs.update(mAP, n)
+
+            t.set_postfix({
+                'loss': objs.avg,
+                'mAP': mAPs.avg,
+            })
+            t.update(1)
+
+    return mAPs.avg, objs.avg
 
 
 if __name__ == '__main__':
