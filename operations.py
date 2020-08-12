@@ -106,3 +106,18 @@ class FactorizedReduce(nn.Module):
         out = self.bn(out)
         return out
 
+
+class FactorizedIncrease(nn.Module):
+    def __init__(self, in_channel, out_channel):
+        super(FactorizedIncrease, self).__init__()
+
+        self._in_channel = in_channel
+        self.op = nn.Sequential(
+            nn.Upsample(scale_factor=2, mode="bilinear"),
+            nn.ReLU(inplace=False),
+            nn.Conv2d(self._in_channel, out_channel, 1, stride=1, padding=0),
+            nn.BatchNorm2d(out_channel)
+        )
+
+    def forward(self, x):
+        return self.op(x)

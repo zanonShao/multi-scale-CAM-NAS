@@ -89,12 +89,14 @@ class Cell(nn.Module):
         self.type = type
         if type == 'up':
             self.C = self.C // 2
-            self.preprocess = ReLUConvBN(C_pre, self.C, 1, 1, 0, affine=False)
+            # self.preprocess = ReLUConvBN(C_pre, self.C, 1, 1, 0, affine=False)
+            self.preprocess = FactorizedIncrease(C_pre, self.C)
         if type == 'same':
             self.preprocess = ReLUConvBN(C_pre, self.C, 1, 1, 0, affine=False)
         if type == 'down':
             self.C = self.C * 2
-            self.preprocess = ReLUConvBN(C_pre, self.C, 1, 1, 0, affine=False)
+            # self.preprocess = ReLUConvBN(C_pre, self.C, 1, 1, 0, affine=False)
+            self.preprocess = FactorizedReduce(C_pre, self.C, affine=False)
         for i in range(self._step):
             for j in range(1 + i):
                 op = MixedOp(self.C, self.stride, self._pc_k)
@@ -114,13 +116,13 @@ class Cell(nn.Module):
             offset += len(states)
             states.append(s)
         cat = torch.cat(states[-self._multiply:], dim=1)
-
-        if self.type == 'up':
-            return F.upsample(cat, size=(cat.size(2) * 2, cat.size(2) * 2), mode='bilinear', align_corners=True)
-        elif self.type == 'same':
-            return cat
-        else:
-            return F.max_pool2d(cat, kernel_size=(2, 2))
+        return cat
+        # if self.type == 'up':
+        #     return F.interpolate(cat, size=(cat.size(2) * 2, cat.size(2) * 2), mode='bilinear', align_corners=True)
+        # elif self.type == 'same':
+        #     return cat
+        # else:
+        #     return F.max_pool2d(cat, kernel_size=(2, 2))
 
 
 class Block(nn.Module):
@@ -131,9 +133,11 @@ class Block(nn.Module):
             self.cells.append(None)
             self.cells.append(Cell(fl_channel * pow(2, y), type='same'))
             self.cells.append(None)
+            self.cells.append(nn.Identity())
         elif x - y == 0:
             assert y != 0
             self.cells.append(Cell(fl_channel * pow(2, y - 1), type='down'))
+            self.cells.append(None)
             self.cells.append(None)
             self.cells.append(None)
         elif x - y == 1:
@@ -141,48 +145,41 @@ class Block(nn.Module):
                 self.cells.append(None)
                 self.cells.append(Cell(fl_channel * pow(2, y), type='same'))
                 self.cells.append(None)
+                self.cells.append(nn.Identity())
             else:
                 self.cells.append(Cell(fl_channel * pow(2, y - 1), type='down'))
                 self.cells.append(Cell(fl_channel * pow(2, y), type='same'))
                 self.cells.append(None)
+                self.cells.append(nn.Identity())
         elif x - y > 1:
             if y == 0:
                 self.cells.append(None)
                 self.cells.append(Cell(fl_channel * pow(2, y), type='same'))
                 self.cells.append(Cell(fl_channel * pow(2, y + 1), type='up'))
+                self.cells.append(nn.Identity())
             elif y == max_scale - 1:  # from 0-max_scale-1
                 self.cells.append(Cell(fl_channel * pow(2, y - 1), type='down'))
                 self.cells.append(Cell(fl_channel * pow(2, y), type='same'))
                 self.cells.append(None)
+                self.cells.append(nn.Identity())
             else:
                 self.cells.append(Cell(fl_channel * pow(2, y - 1), type='down'))
                 self.cells.append(Cell(fl_channel * pow(2, y), type='same'))
                 self.cells.append(Cell(fl_channel * pow(2, y + 1), type='up'))
+                self.cells.append(nn.Identity())
 
-    #
     def forward(self, x, w_alpha, w_beta, w_p):
-        flag = True
-        for i, _ in enumerate(x):
-            if _ == None:
+        out = []
+        for i, cell in enumerate(self.cells):
+            # if _ == None:
+            if cell is None:
                 continue
-            if i == 1:
-                if flag:
-                    out = x[1] * w_beta[3]
-                    flag = False
-                else:
-                    out += x[1] * w_beta[3]
-            if flag:
-                out = self.cells[i](x[i], w_alpha[i], w_p[i]) * w_beta[i]
-                flag = False
             else:
-                out += self.cells[i](x[i], w_alpha[i], w_p[i]) * w_beta[i]
-
-        # out = x[1] * w_beta[3]  # skipconnection
-        # for i, cell in enumerate(self.cells):
-        #     if cell == None:
-        #         continue
-        #     out += cell(x[i], w_alpha[i], w_p[i]) * w_beta[i]
-        return out
+                if i != 3:
+                    out.append(cell(x[i], w_alpha[i], w_p[i]) * w_beta[i])
+                else:
+                    out.append(cell(x[1]) * w_beta[3])
+        return sum(out)
 
 
 class trapezoid_supernet(pl.LightningModule):
@@ -194,7 +191,7 @@ class trapezoid_supernet(pl.LightningModule):
         self.max_scale = max_scale
         self.fl_channel = fl_channel
 
-        C_curr = self.fl_channel
+        # C_curr = self.fl_channel
 
         # self.stem = nn.Sequential(
         #     nn.Conv2d(3, C_curr, kernel_size=3, stride=1, padding=1, bias=False),
@@ -224,15 +221,17 @@ class trapezoid_supernet(pl.LightningModule):
             Blocks = nn.ModuleList()
             if x < self.max_scale:
                 for y in range(0, x + 1):
-                    Blocks.append(Block(x, y, self.max_scale, C_curr))
+                    Blocks.append(Block(x, y, self.max_scale, self.fl_channel))
             else:
                 for y in range(0, self.max_scale):
-                    Blocks.append(Block(x, y, self.max_scale, C_curr))
+                    Blocks.append(Block(x, y, self.max_scale, self.fl_channel))
             self.Layers.append(Blocks)
 
-        self.Classfiers = nn.ModuleList()
+        self.feature_mix = nn.ModuleList()
         for i in range(self.max_scale):
-            self.Classfiers.append(nn.Conv2d(fl_channel * pow(2, i), 20, 1))
+            self.feature_mix.append(nn.Conv2d(fl_channel * pow(2, i), 20, 1))
+
+        self.Classifier = nn.Linear(20 * self.max_scale, 20)
 
         self._initialize_alphas()
 
@@ -240,19 +239,38 @@ class trapezoid_supernet(pl.LightningModule):
         normalized_betas = torch.zeros(self.num_layers, 4, self.max_scale)
 
         # softmax the alphas
+        # for i, blocks in enumerate(self.Layers):
+        #     j = len(blocks)
+        #     for k in range(4):
+        #         start = 0
+        #         end = j
+        #         if k == 0:  # down has no j=0 blocks
+        #             start = start + 1
+        #         if k == 2:  # up has no j = max Blocks
+        #             end = j - 1
+        #         try:
+        #             normalized_betas[i][k][start:end] = F.softmax(self.betas[i][k][start:end], dim=-1)
+        #         except:
+        #             pass
+        pre_blocks_len = 1
         for i, blocks in enumerate(self.Layers):
             j = len(blocks)
             for k in range(4):
                 start = 0
                 end = j
-                if k == 0:  # down has no j=0 blocks
-                    start = start + 1
-                if k == 2:  # up has no j = max Blocks
-                    end = j - 1
-                try:
-                    normalized_betas[i][k][:j] = F.softmax(self.betas[i][k][start:end], dim=-1)
-                except:
-                    pass
+                if k == 0:
+                    start = 1
+                    end = min(pre_blocks_len + 1, j)
+                elif k == 1 or k == 3:
+                    start = 0
+                    end = pre_blocks_len
+                else:
+                    start = 0
+                    end = pre_blocks_len - 1
+                if start < end:
+                    normalized_betas[i][k][start:end] = F.softmax(self.betas[i][k][start:end], dim=-1)
+            pre_blocks_len = j
+
         normalized_betas = normalized_betas.cuda()
 
         normalized_alph = []
@@ -273,8 +291,8 @@ class trapezoid_supernet(pl.LightningModule):
             start = end
             n += 1
             weights2_down = torch.cat([weights2_down, tw2_down], dim=0)
-            weights2_same = torch.cat([weights2_same, tw2_down], dim=0)
-            weights2_up = torch.cat([weights2_up, tw2_down], dim=0)
+            weights2_same = torch.cat([weights2_same, tw2_same], dim=0)
+            weights2_up = torch.cat([weights2_up, tw2_up], dim=0)
         normalized_p = [weights2_down, weights2_same, weights2_up]
 
         xs_pre = [None for i in range(self.max_scale)]
@@ -301,10 +319,12 @@ class trapezoid_supernet(pl.LightningModule):
             xs_pre = xs_curr
 
         # classify layers
-        xs_curr = [F.adaptive_avg_pool2d(self.Classfiers[i](x), 1) for i, x in enumerate(xs_curr)]
-        xs_curr = torch.stack(xs_curr)
-        xs_curr = torch.mean(xs_curr, dim=0)
-        return xs_curr.squeeze()
+        xs_curr = [F.adaptive_avg_pool2d(self.feature_mix[i](x), 1) for i, x in enumerate(xs_curr)]
+        xs_curr = torch.stack(xs_curr, dim=1)
+        xs_curr = xs_curr.reshape([xs_curr.shape[0], -1])
+        logits = self.Classifier(xs_curr)
+        # xs_curr = torch.mean(xs_curr, dim=0)
+        return logits
 
     def _initialize_alphas(self):
         k_edge = sum(1 for i in range(self._steps) for n in range(1 + i))
@@ -374,7 +394,6 @@ class trapezoid_supernet(pl.LightningModule):
             else:
                 continue
 
-
     def training_step(self, batch, batch_nb):
         x, y = batch
         # print(x.shape)
@@ -416,8 +435,6 @@ class trapezoid_supernet(pl.LightningModule):
                 optimizer.zero_grad()
 
 
-
-# CUDA_VISIBLE_DEVICES=0
 if __name__ == '__main__':
     import os
 

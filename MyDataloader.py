@@ -26,7 +26,7 @@ class mydataset(Dataset):
         else:
             self.transform = transforms.Compose([
                 transforms.Resize(256),
-                transforms.CenterCrop(shape),
+                transforms.CenterCrop(224),
                 transforms.ToTensor(),
                 transforms.Normalize(mean=[0.4604598566668132, 0.43647458501470804, 0.4032827079361192],
                                      std=[0.4604598566668132, 0.43647458501470804, 0.4032827079361192]),
@@ -35,7 +35,7 @@ class mydataset(Dataset):
     def __getitem__(self, item):
         image = Image.open(os.path.join(self.dataroot,self.image_path[item]+'.jpg')).convert('RGB')
         image = self.transform(image)
-        label = torch.tensor(self.lable[item])
+        label = torch.tensor(self.lable[item]).float()
         return image,label
 
     def __len__(self):
@@ -50,8 +50,28 @@ class mydataset(Dataset):
         else:
             raise ('No this data type')
 
+    def get_cam_examples(self,number):
+        data_len = len(self)
+        raws = []
+        images = []
+        lables = []
+        for i in range(0, data_len - data_len % number, (data_len - data_len % number) // number):
+            image = Image.open(os.path.join(self.dataroot, self.image_path[i] + '.jpg')).convert('RGB')
+            image = self.transform(image)
+            mean = np.array([0.4604598566668132, 0.43647458501470804, 0.4032827079361192])
+            std = np.array([0.4604598566668132, 0.43647458501470804, 0.4032827079361192])
+            raw = np.uint8((image * np.array([[std, ], ]).transpose(2, 0, 1) + np.array([[mean, ], ]).transpose(2,0,1)) * 255)
+            raw=np.transpose(raw, (1, 2, 0))
+            label = torch.tensor(self.lable[i]).float()
+            raws.append(raw)
+            images.append(image)
+            lables.append(label)
+        assert len(images) == number
+        return images, lables, raws
+
 if __name__ == '__main__':
     dataset = mydataset(dataroot='/NAS_REMOTE/shaozl/dataset/Pascal_VOC/VOC_2012/VOCdevkit/VOC2012/JPEGImages/',lableroot='/NAS_REMOTE/shaozl/MS-CAM-NAS/',phase='val')
+
     print(len(dataset))
     print(dataset[686])
 

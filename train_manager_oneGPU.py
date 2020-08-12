@@ -14,10 +14,11 @@ from tqdm import tqdm
 import os
 import torch.nn.functional as F
 import utils
+from CAM import CAM_example, CAM_example_2
 from tensorboardX import SummaryWriter
 
 parser = argparse.ArgumentParser("VOC_2012")
-parser.add_argument('--workers', type=int, default=4, help='number of workers to load dataset')
+parser.add_argument('--workers', type=int, default=8, help='number of workers to load dataset')
 # parser.add_argument('--data', type=str, default='/tmp/cache/', help='location of the data corpus')
 parser.add_argument('--batch_size', type=int, default=36, help='batch size')
 parser.add_argument('--base_lr', type=float, default=0.025, help='init learning rate')
@@ -33,7 +34,6 @@ parser.add_argument('--exp_name', type=str, default='exp_temp', help='folder und
 # parser.add_argument('--cutout', action='store_true', default=False, help='use cutout')
 # parser.add_argument('--cutout_length', type=int, default=16, help='cutout length')
 # parser.add_argument('--drop_path_prob', type=float, default=0.3, help='drop path probability')
-parser.add_argument('--save', type=str, default='./', help='experiment name')
 # parser.add_argument('--seed', type=int, default=2, help='random seed')
 # parser.add_argument('--grad_clip', type=float, default=5, help='gradient clipping')
 # parser.add_argument('--unrolled', action='store_true', default=False, help='use one-step unrolled validation loss')
@@ -44,6 +44,8 @@ parser.add_argument('--val_frequency', type=int, default=5, help='val frequency'
 parser.add_argument('--tensorboard_frequency', type=int, default=50,
                     help='every x times to save in tensorboardX during training')
 parser.add_argument('--gpus', type=str, default='0')
+parser.add_argument('--reuse', type=str, default=None,
+                    help='if reuse is not None, load the checkpoint form --result path/reuse')
 args = parser.parse_args()
 
 savepath_for_this_exp = os.path.join(args.result_path, args.exp_name)
@@ -71,9 +73,9 @@ def main():
                             lableroot='/NAS_REMOTE/shaozl/MS-CAM-NAS/', phase='val')
 
     model = trapezoid_supernet(max_scale=4, num_layers=12).cuda()
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size)
-    val_loader = DataLoader(val_dataset, batch_size=args.batch_size, pin_memory=True, num_workers=5)
-    val_loader_2 = DataLoader(val_dataset, batch_size=args.batch_size * 100, pin_memory=True, num_workers=5)
+    train_loader = DataLoader(train_dataset, batch_size=args.batch_size,pin_memory=True, num_workers=args.workers)
+    val_loader = DataLoader(val_dataset, batch_size=args.batch_size, pin_memory=True, num_workers=args.workers)
+    val_loader_2 = DataLoader(val_dataset, batch_size=3600, pin_memory=True, num_workers=args.workers)
 
     criterion = nn.BCEWithLogitsLoss().cuda()
     optimizer = torch.optim.SGD(model.weight_parameters(),
@@ -82,17 +84,24 @@ def main():
                                 weight_decay=args.weight_decay)
     optimizer_a = torch.optim.Adam(model.arch_parameters(), lr=init_arch_lr, betas=(0.9, 0.999),
                                    weight_decay=args.arch_weight_decay)
-
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, float(args.epochs), eta_min=args.learning_rate_min)
-
     best_mAP = 0
-    for epoch in range(args.epochs):
+    start_epoch = 0
+    if args.reuse != None:
+        print('load_state_dict from %s' % os.path.join(args.result_path, args.reuse))
+        checkpoint = torch.load(os.path.join(args.result_path, args.reuse))
+        model.load_state_dict(checkpoint['state_dict'])
+        optimizer.load_state_dict(checkpoint['optimizer'])
+        optimizer_a.load_state_dict(checkpoint['optimizer_a'])
+        start_epoch = checkpoint['epoch'] + 1
+        best_mAP = checkpoint['best_acc_top1']
+
+    for epoch in range(start_epoch, args.epochs):
         current_lr = scheduler.get_last_lr()[0]
 
         mAP, obj = train(train_loader, val_loader, model, optimizer, optimizer_a, criterion,
                          current_lr, epoch)
-        scheduler.step()
 
         is_best = False
         if epoch % args.val_frequency == 0:
@@ -101,11 +110,18 @@ def main():
             if mAP > best_mAP:
                 best_mAP = mAP
                 is_best = True
+            with torch.no_grad():
+                htitch_raw, heatmap, results = CAM_example_2(val_dataset, model, 10, 4)
 
             logging.info('Val Epoch: %d best_mAP: %3f mAP: %3f loss: %3f', epoch, best_mAP, mAP, obj)
             writer.add_scalar('val/loss', obj, epoch)
             writer.add_scalar('val/mAP', mAP, epoch)
             writer.add_scalar('val/best_mAP', best_mAP, epoch)
+            writer.add_image('heatmap', heatmap, epoch, dataformats='HWC')
+            writer.add_image('results', results, epoch, dataformats='HWC')
+            writer.add_image('htitch_raw', htitch_raw, epoch, dataformats='HWC')
+
+        scheduler.step()
 
         utils.save_checkpoint({
             'epoch': epoch,
@@ -139,11 +155,16 @@ def train(train_loader, val_loader, model, optimizer, optimizer_a, criterion, lr
             #     input_search, target_search = next(valid_queue_iter)
             # except:
             # valid_queue_iter = iter(val_loader)
-            input_search, target_search = next(val_loader)
-            input_search = input_search.cuda(non_blocking=True)
-            target_search = target_search.cuda(non_blocking=True)
+            if epoch < args.begin:
+                if step == 0:
+                    input_search, target_search = next(val_loader)
+                    input_search = input_search.cuda(non_blocking=True)
+                    target_search = target_search.cuda(non_blocking=True)
 
-            if epoch >= args.begin:
+            elif epoch >= args.begin:
+                input_search, target_search = next(val_loader)
+                input_search = input_search.cuda(non_blocking=True)
+                target_search = target_search.cuda(non_blocking=True)
                 optimizer_a.zero_grad()
                 logits = model(input_search)
                 loss_a = criterion(logits, target_search)
